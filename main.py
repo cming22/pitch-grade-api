@@ -30,6 +30,7 @@ FEATURES = [
     "ax_diff",
 ]
 
+
 class PitchRequest(BaseModel):
     start_speed: float
     spin_rate: float
@@ -42,6 +43,7 @@ class PitchRequest(BaseModel):
     az_diff: float
     ax_diff: float
 
+
 class RawPitch(BaseModel):
     pitch_type: str
     pitcher_hand: Optional[str] = "R"
@@ -53,12 +55,15 @@ class RawPitch(BaseModel):
     RelSide: float
     RelHeight: float
 
+
 class BatchRequest(BaseModel):
     pitches: List[RawPitch]
+
 
 @app.get("/")
 def root():
     return {"ok": True, "message": "Pitch grade API is live"}
+
 
 @app.post("/predict")
 def predict(payload: PitchRequest):
@@ -67,6 +72,7 @@ def predict(payload: PitchRequest):
     raw = float(pred)
     tj_stuff_plus = 100 - (((raw - 0.35) / 0.68) * 10)
     return {"pitch_grade": round(tj_stuff_plus, 1)}
+
 
 def normalize_pitch_type(pitch_type: str) -> str:
     pt = (pitch_type or "").strip().lower()
@@ -91,45 +97,56 @@ def normalize_pitch_type(pitch_type: str) -> str:
     }
     return mapping.get(pt, pitch_type)
 
-def get_mapped_ax_x0(pitch: RawPitch):
+
+def map_ax_x0(pitch: RawPitch):
     hand = (pitch.pitcher_hand or "R").upper()
+    az = pitch.InducedVertBreak
+
     if hand == "L":
         ax = -pitch.HorzBreak
         x0 = pitch.RelSide
     else:
         ax = pitch.HorzBreak
         x0 = -pitch.RelSide
-    return ax, x0
+
+    return az, ax, x0
+
 
 @app.post("/predict_batch")
 def predict_batch(payload: BatchRequest):
-    pitches = payload.pitches
-    if not pitches:
-        return {"pitches": [], "summary": []}
+    if not payload.pitches:
+        return {"baseline_type": None, "pitches": [], "summary": []}
 
     rows = []
-    for p in pitches:
+    for p in payload.pitches:
         norm_type = normalize_pitch_type(p.pitch_type)
-        ax, x0 = get_mapped_ax_x0(p)
+        az, ax, x0 = map_ax_x0(p)
+
         rows.append({
             "pitch_type": norm_type,
-            "pitcher_hand": p.pitcher_hand,
-            "start_speed": p.RelSpeed,
-            "spin_rate": p.SpinRate,
-            "extension": p.Extension,
-            "az": p.InducedVertBreak,
-            "ax": ax,
-            "x0": x0,
-            "z0": p.RelHeight,
             "raw_pitch_type": p.pitch_type,
+            "pitcher_hand": (p.pitcher_hand or "R").upper(),
+            "start_speed": float(p.RelSpeed),
+            "spin_rate": float(p.SpinRate),
+            "extension": float(p.Extension),
+            "az": float(az),
+            "ax": float(ax),
+            "x0": float(x0),
+            "z0": float(p.RelHeight),
         })
 
     df = pd.DataFrame(rows)
 
     fastball_types = ["FF", "SI", "FC"]
     fb_candidates = df[df["pitch_type"].isin(fastball_types)].copy()
+
     if fb_candidates.empty:
-        return {"pitches": [], "summary": [], "error": "No fastball baseline found"}
+        return {
+            "baseline_type": None,
+            "pitches": [],
+            "summary": [],
+            "error": "No fastball baseline found"
+        }
 
     fb_grouped = (
         fb_candidates.groupby("pitch_type")
@@ -144,10 +161,10 @@ def predict_batch(payload: BatchRequest):
     )
 
     baseline = fb_grouped.iloc[0]
+    baseline_type = str(baseline["pitch_type"])
     baseline_speed = float(baseline["avg_speed"])
     baseline_az = float(baseline["avg_az"])
     baseline_ax = float(baseline["avg_ax"])
-    baseline_type = str(baseline["pitch_type"])
 
     df["speed_diff"] = df["start_speed"] - baseline_speed
     df["az_diff"] = df["az"] - baseline_az
@@ -174,6 +191,7 @@ def predict_batch(payload: BatchRequest):
         )
         .reset_index()
     )
+
     summary["stuff_plus"] = summary["stuff_plus"].round(1)
     summary["velo"] = summary["velo"].round(1)
     summary["ivb"] = summary["ivb"].round(1)
