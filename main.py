@@ -1,3 +1,4 @@
+from typing import List, Optional
 from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,7 +7,6 @@ import joblib
 
 app = FastAPI()
 
-# Allow requests from your app (CORS fix)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,10 +15,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load model
 model = joblib.load("lgbm_model.joblib")
 
-# Feature order (must match training)
 FEATURES = [
     "start_speed",
     "spin_rate",
@@ -32,7 +30,6 @@ FEATURES = [
     "ax_diff",
 ]
 
-# Request schema
 class PitchRequest(BaseModel):
     start_speed: float
     spin_rate: float
@@ -45,25 +42,146 @@ class PitchRequest(BaseModel):
     az_diff: float
     ax_diff: float
 
-# Health check
+class RawPitch(BaseModel):
+    pitch_type: str
+    pitcher_hand: Optional[str] = "R"
+    RelSpeed: float
+    SpinRate: float
+    Extension: float
+    InducedVertBreak: float
+    HorzBreak: float
+    RelSide: float
+    RelHeight: float
+
+class BatchRequest(BaseModel):
+    pitches: List[RawPitch]
+
 @app.get("/")
 def root():
     return {"ok": True, "message": "Pitch grade API is live"}
 
-# Prediction endpoint
 @app.post("/predict")
 def predict(payload: PitchRequest):
-    df = pd.DataFrame(
-        [[getattr(payload, f) for f in FEATURES]],
-        columns=FEATURES
-    )
-
+    df = pd.DataFrame([[getattr(payload, f) for f in FEATURES]], columns=FEATURES)
     pred = model.predict(df)[0]
-
-    # Convert raw prediction to tjStuff+
     raw = float(pred)
     tj_stuff_plus = 100 - (((raw - 0.35) / 0.68) * 10)
+    return {"pitch_grade": round(tj_stuff_plus, 1)}
+
+def normalize_pitch_type(pitch_type: str) -> str:
+    pt = (pitch_type or "").strip().lower()
+    mapping = {
+        "ff": "FF",
+        "four-seam": "FF",
+        "four-seam fastball": "FF",
+        "4-seam": "FF",
+        "4-seam fastball": "FF",
+        "si": "SI",
+        "sinker": "SI",
+        "two-seam": "SI",
+        "two-seam fastball": "SI",
+        "fc": "FC",
+        "cutter": "FC",
+        "sl": "SL",
+        "slider": "SL",
+        "cu": "CU",
+        "curveball": "CU",
+        "ch": "CH",
+        "changeup": "CH",
+    }
+    return mapping.get(pt, pitch_type)
+
+def get_mapped_ax_x0(pitch: RawPitch):
+    hand = (pitch.pitcher_hand or "R").upper()
+    if hand == "L":
+        ax = -pitch.HorzBreak
+        x0 = pitch.RelSide
+    else:
+        ax = pitch.HorzBreak
+        x0 = -pitch.RelSide
+    return ax, x0
+
+@app.post("/predict_batch")
+def predict_batch(payload: BatchRequest):
+    pitches = payload.pitches
+    if not pitches:
+        return {"pitches": [], "summary": []}
+
+    rows = []
+    for p in pitches:
+        norm_type = normalize_pitch_type(p.pitch_type)
+        ax, x0 = get_mapped_ax_x0(p)
+        rows.append({
+            "pitch_type": norm_type,
+            "pitcher_hand": p.pitcher_hand,
+            "start_speed": p.RelSpeed,
+            "spin_rate": p.SpinRate,
+            "extension": p.Extension,
+            "az": p.InducedVertBreak,
+            "ax": ax,
+            "x0": x0,
+            "z0": p.RelHeight,
+            "raw_pitch_type": p.pitch_type,
+        })
+
+    df = pd.DataFrame(rows)
+
+    fastball_types = ["FF", "SI", "FC"]
+    fb_candidates = df[df["pitch_type"].isin(fastball_types)].copy()
+    if fb_candidates.empty:
+        return {"pitches": [], "summary": [], "error": "No fastball baseline found"}
+
+    fb_grouped = (
+        fb_candidates.groupby("pitch_type")
+        .agg(
+            pitch_count=("pitch_type", "size"),
+            avg_speed=("start_speed", "mean"),
+            avg_az=("az", "mean"),
+            avg_ax=("ax", "mean"),
+        )
+        .reset_index()
+        .sort_values(["pitch_count", "avg_speed"], ascending=[False, False])
+    )
+
+    baseline = fb_grouped.iloc[0]
+    baseline_speed = float(baseline["avg_speed"])
+    baseline_az = float(baseline["avg_az"])
+    baseline_ax = float(baseline["avg_ax"])
+    baseline_type = str(baseline["pitch_type"])
+
+    df["speed_diff"] = df["start_speed"] - baseline_speed
+    df["az_diff"] = df["az"] - baseline_az
+    df["ax_diff"] = (df["ax"] - baseline_ax).abs()
+
+    model_df = df[FEATURES].copy()
+    preds = model.predict(model_df)
+
+    df["raw_prediction"] = preds.astype(float)
+    df["stuff_plus"] = 100 - (((df["raw_prediction"] - 0.35) / 0.68) * 10)
+    df["stuff_plus"] = df["stuff_plus"].round(1)
+
+    pitch_results = df.to_dict(orient="records")
+
+    summary = (
+        df.groupby("pitch_type")
+        .agg(
+            stuff_plus=("stuff_plus", "mean"),
+            velo=("start_speed", "mean"),
+            ivb=("az", "mean"),
+            hb=("ax", "mean"),
+            spin=("spin_rate", "mean"),
+            num=("pitch_type", "size"),
+        )
+        .reset_index()
+    )
+    summary["stuff_plus"] = summary["stuff_plus"].round(1)
+    summary["velo"] = summary["velo"].round(1)
+    summary["ivb"] = summary["ivb"].round(1)
+    summary["hb"] = summary["hb"].round(1)
+    summary["spin"] = summary["spin"].round(0)
 
     return {
-        "pitch_grade": round(tj_stuff_plus, 1)
+        "baseline_type": baseline_type,
+        "pitches": pitch_results,
+        "summary": summary.to_dict(orient="records"),
     }
