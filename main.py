@@ -41,4 +41,10 @@ def predict(payload: PitchRequest):
     row = [[getattr(payload, f) for f in FEATURES]]
     df = pd.DataFrame(row, columns=FEATURES)
     pred = model.predict(df)[0]
-    return {"pitch_grade": float(pred)}
+raw = float(pred)
+
+tj_stuff_plus = 100 - (((raw - 0.35) / 0.68) * 10)
+
+return {
+    "pitch_grade": round(tj_stuff_plus, 1)
+}
