@@ -38,13 +38,12 @@ def root():
 
 @app.post("/predict")
 def predict(payload: PitchRequest):
-    row = [[getattr(payload, f) for f in FEATURES]]
-    df = pd.DataFrame(row, columns=FEATURES)
+    df = pd.DataFrame([[getattr(payload, f) for f in FEATURES]], columns=FEATURES)
     pred = model.predict(df)[0]
-    
+
     raw = float(pred)
     tj_stuff_plus = 100 - (((raw - 0.35) / 0.68) * 10)
 
-return {
-    "pitch_grade": round(tj_stuff_plus, 1)
-}
+    return {
+        "pitch_grade": round(tj_stuff_plus, 1)
+    }
